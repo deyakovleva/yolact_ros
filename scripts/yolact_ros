@@ -77,6 +77,7 @@ class YolactNode:
     self.net = net
 
     self.image_pub = rospy.Publisher("~visualization", Image, queue_size=1)
+    self.crop_mask_pub = rospy.Publisher("~crop_masks", Image, queue_size=1)
 
     self.detections_pub = rospy.Publisher("~detections", Detections, queue_size=1)
 
@@ -103,10 +104,10 @@ class YolactNode:
     self.display_bboxes = True
     self.display_text = True
     self.display_scores = True
-    self.display_fps = False
+    self.display_fps = True
     self.score_threshold = 0.0
     self.crop_masks = True
-    self.top_k = 5
+    self.top_k = 10
 
     self.image_sub = None # subscriber is created in dynamic_reconfigure callback
 
@@ -163,12 +164,13 @@ class YolactNode:
           if cfg.eval_mask_branch:
               # Masks are drawn on the GPU, so don't copy
               masks = t[3][idx]
+
           classes, scores, boxes = [x[idx].cpu().numpy() for x in t[:3]]
 
       return classes, scores, boxes, masks
 
 
-  def prep_display(self, classes, scores, boxes, masks, img, class_color=False, mask_alpha=0.45, fps_str=''):
+  def prep_display(self, classes, scores, boxes, masks, img, class_color=False, mask_alpha=0.45, fps_str='', mask_only=True):
 
       img_gpu = img / 255.0
 
@@ -219,6 +221,24 @@ class YolactNode:
               masks_color_summand += masks_color_cumul.sum(dim=0)
 
           img_gpu = img_gpu * inv_alph_masks.prod(dim=0) + masks_color_summand
+
+
+          # put all rgb masks in topic
+          if mask_only:
+            masks_no_color = masks.repeat(1, 1, 1, 3) #* mask_alpha
+            masks_no_color_summand = masks_no_color[0]
+
+            if num_dets_to_consider > 1:
+              inv_alph_cumul = inv_alph_masks[:(num_dets_to_consider-1)].cumprod(dim=0)
+              masks_no_color_cumul = masks_no_color[1:] * inv_alph_cumul
+              masks_no_color_summand += masks_no_color_cumul.sum(dim=0)
+
+            img_mask =  inv_alph_masks.prod(dim=0) + masks_no_color_summand * img
+            img_mask_numpy = (img_mask).byte().cpu().numpy()
+
+          self.crop_mask_pub.publish(self.bridge.cv2_to_imgmsg(img_mask_numpy, "bgr8"))
+            
+            
 
       if self.display_fps:
               # Draw the box for the fps on the GPU
@@ -285,10 +305,27 @@ class YolactNode:
       det.box.x2 = int(x2)
       det.box.y2 = int(y2)
       mask = masks[detnum,y1:y2,x1:x2]
+      # print('type')
+      # print(type(det.mask.mask))
       det.mask.mask = np.packbits(mask.bool().cpu()).tolist()
       det.mask.height = int(y2 - y1)
       det.mask.width = int(x2 - x1)
       dets_msg.detections.append(det)
+      
+      # print(type(det.mask.mask))
+
+      # unpacked_mask = np.unpackbits(np.array(det.mask.mask,dtype=np.uint8), count=det.mask.height*det.mask.width)
+      
+      # unpacked_mask = unpacked_mask.reshape((det.mask.height, det.mask.width))
+      # print('unpacked_mask')
+      # print(type(unpacked_mask))
+      # print(unpacked_mask)
+
+      # if self.publish_visualization:
+      #   try:
+      #     self.crop_mask_pub.publish(self.bridge.cv2_to_imgmsg(unpacked_mask, "mono8"))
+      #   except CvBridgeError as e:
+      #     print(e)
 
       #encoding_correct = True
       #for x in range(det.mask.width):
@@ -330,6 +367,7 @@ class YolactNode:
       if self.publish_visualization:
         try:
           self.image_pub.publish(self.bridge.cv2_to_imgmsg(image, "bgr8"))
+          # self.crop_mask_pub.publish(self.bridge.cv2_to_imgmsg(masks, "bgr8"))
         except CvBridgeError as e:
           print(e)
 
