@@ -10,7 +10,9 @@ import cv2
 import threading
 from queue import Queue
 from std_msgs.msg import String
+import message_filters
 from std_msgs.msg import Header
+from sensor_msgs.msg import CameraInfo
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import CompressedImage
 from yolact_ros_msgs.msg import Detections
@@ -43,6 +45,11 @@ iou_thresholds = [x / 100 for x in range(50, 100, 5)]
 coco_cats = {} # Call prep_coco_cats to fill this
 coco_cats_inv = {}
 color_cache = defaultdict(lambda: {})
+
+from scipy.spatial.transform import Rotation as R
+import threading
+
+lock = threading.Lock()
 
 class SynchronizedObject:
   def __init__(self):
@@ -78,6 +85,10 @@ class YolactNode:
 
     self.image_pub = rospy.Publisher("~visualization", Image, queue_size=1)
     self.crop_mask_pub = rospy.Publisher("~crop_masks", Image, queue_size=1)
+    self.crop_mask_depth_pub = rospy.Publisher("~crop_masks_depth", Image, queue_size=1)
+
+    depth_sub = message_filters.Subscriber('/camera/depth/image_rect_raw', Image, queue_size=10)
+    camera_sub = message_filters.Subscriber('/camera/depth/camera_info', CameraInfo, queue_size=10)
 
     self.detections_pub = rospy.Publisher("~detections", Detections, queue_size=1)
 
@@ -115,6 +126,35 @@ class YolactNode:
     self.fps = 0
     self.last_reset_time = rospy.Time()
     self.frame_counter = 0
+
+    ts = message_filters.ApproximateTimeSynchronizer(
+    [depth_sub, camera_sub], 10, 0.1)
+    ts.registerCallback(self.callback_depth)
+
+  def callback_depth(self, depth, cam_K):
+
+    self.camera_matrix_K = np.array(cam_K.K).reshape((3, 3))
+
+    self.depth_encoding = depth.encoding
+    if depth.encoding == '32FC1':
+      depth_cv = self.bridge.imgmsg_to_cv2(depth)
+    elif depth.encoding == '16UC1':
+      depth_cv = self.bridge.imgmsg_to_cv2(depth).copy().astype(np.float32)
+      depth_cv /= 1000.0
+    elif depth.encoding == '8UC1':
+      depth_cv = self.bridge.imgmsg_to_cv2(depth).copy().astype(np.float32)
+      depth_cv /= 1000.0
+    else:
+      rospy.logerr_throttle(
+        1, 'Unsupported depth type. Expected 16UC1 or 32FC1, got {}'.format(
+          depth.encoding))
+      return    
+
+    with lock:
+      self.depth = depth_cv.copy()
+      self.camera_info_ros = cam_K
+      # глубина выводится в топик, все ок
+      # self.crop_mask_depth_pub.publish(depth)
 
   def visualizationLoop(self):
       print('Creating cv2 window')
@@ -173,6 +213,9 @@ class YolactNode:
   def prep_display(self, classes, scores, boxes, masks, img, class_color=False, mask_alpha=0.45, fps_str='', mask_only=True):
 
       img_gpu = img / 255.0
+      depth_gpu = self.depth
+      depth_gpu_torch = torch.from_numpy(self.depth).cuda().float()
+      depth_gpu_torch = depth_gpu_torch[:,:,None]
 
       num_dets_to_consider = min(self.top_k, classes.shape[0])
       for j in range(num_dets_to_consider):
@@ -180,6 +223,7 @@ class YolactNode:
               num_dets_to_consider = j
               break
 
+      # окрашивание
       # Quick and dirty lambda for selecting the color for a particular index
       # Also keeps track of a per-gpu color cache for maximum speed
       def get_color(j, on_gpu=None):
@@ -208,36 +252,102 @@ class YolactNode:
           colors = torch.cat([get_color(j, on_gpu=img_gpu.device.index).view(1, 1, 1, 3) for j in range(num_dets_to_consider)], dim=0)
           masks_color = masks.repeat(1, 1, 1, 3) * colors * mask_alpha
 
+          # Prepare the RGB images for each mask given their color (size [num_dets, h, w, 1])
+          # colors_depth = torch.cat([get_color(j, on_gpu=depth_gpu_torch.device.index).view(1, 1, 1, 3) for j in range(num_dets_to_consider)], dim=0)
+          # masks_color_depth = masks.repeat(1, 1, 1, 3) * colors_depth * mask_alpha
+
           # This is 1 everywhere except for 1-mask_alpha where the mask is
-          inv_alph_masks = masks * (-mask_alpha) + 1
+          # inv_alph_masks все что не маска, mask_alpha - интенсивность маски 
+          inv_alph_masks = masks * (- mask_alpha) + 1
+          inv_alph_masks_depth = masks * (- mask_alpha) + 1
 
           # I did the math for this on pen and paper. This whole block should be equivalent to:
           #    for j in range(num_dets_to_consider):
           #        img_gpu = img_gpu * inv_alph_masks[j] + masks_color[j]
+
+          # сумма цветов масок?
           masks_color_summand = masks_color[0]
           if num_dets_to_consider > 1:
               inv_alph_cumul = inv_alph_masks[:(num_dets_to_consider-1)].cumprod(dim=0)
               masks_color_cumul = masks_color[1:] * inv_alph_cumul
               masks_color_summand += masks_color_cumul.sum(dim=0)
 
+        
+          # print('img_gpu')
+          # print(img_gpu.size(dim=1))
+          # print('inv_alph_masks')
+          # print(inv_alph_masks.size(dim=1))
+          # print('masks_color_summand')
+          # print(masks_color_summand.size(dim=1))
+          # print('img_gpu')
+          # print(img_gpu.size(dim=0))
+          # print('inv_alph_masks')
+          # print(inv_alph_masks.size(dim=0))
+          # print('masks_color_summand')
+          # print(masks_color_summand.size(dim=0))
+          # print('----')
           img_gpu = img_gpu * inv_alph_masks.prod(dim=0) + masks_color_summand
+          # print('img_gpu')
+          # print(img_gpu.size(dim=1))
+          # print('inv_alph_masks')
+          # print(inv_alph_masks.size(dim=1))
+          # print('masks_color_summand')
+          # print(masks_color_summand.size(dim=1))
+          # print('img_gpu')
+          # print(img_gpu.size(dim=0))
+          # print('inv_alph_masks')
+          # print(inv_alph_masks.size(dim=0))
+          # print('masks_color_summand')
+          # print(masks_color_summand.size(dim=0))
+          # print('----')
+          # print('depth_gpu_torch')
+          # print(depth_gpu_torch.size(dim=1))
+          # print('inv_alph_masks')
+          # print(inv_alph_masks.size(dim=1))
+          # print('masks_color_summand')
+          # print(masks_color_summand.size(dim=1))
+          # print('depth_gpu_torch')
+          # print(depth_gpu_torch.size(dim=0))
+          # print('inv_alph_masks')
+          # print(inv_alph_masks.size(dim=0))
+          # print('masks_color_summand')
+          # print(masks_color_summand.size(dim=0))
 
+          # depth_gpu_torch = depth_gpu_torch * inv_alph_masks.prod(dim=0) + masks_color_summand
 
           # put all rgb masks in topic
+          # выводит обрезанные маски в топик
           if mask_only:
+            # print('masks')
+            # print(masks.size())
             masks_no_color = masks.repeat(1, 1, 1, 3) #* mask_alpha
+            # print('masks_no_color')
+            # print(masks_no_color.size())
+
+             # для массива всех масок, чтоб все выводились а не одна
             masks_no_color_summand = masks_no_color[0]
+            masks_summand = masks[0]
 
             if num_dets_to_consider > 1:
               inv_alph_cumul = inv_alph_masks[:(num_dets_to_consider-1)].cumprod(dim=0)
               masks_no_color_cumul = masks_no_color[1:] * inv_alph_cumul
               masks_no_color_summand += masks_no_color_cumul.sum(dim=0)
 
+              masks_cumul = masks[1:] * inv_alph_cumul
+              masks_summand += masks_cumul.sum(dim=0)              
+            # print('masks_no_color_sum')
+            # print(masks_no_color_summand.size())
             img_mask =  inv_alph_masks.prod(dim=0) + masks_no_color_summand * img
+            # print('img')
+            # print(img.size())
             img_mask_numpy = (img_mask).byte().cpu().numpy()
+            # print(depth_gpu_torch.size())
+
+            depth_mask = inv_alph_masks_depth.prod(dim=0) + masks_summand * depth_gpu_torch
+            depth_mask_numpy = (depth_mask).byte().cpu().numpy()
 
           self.crop_mask_pub.publish(self.bridge.cv2_to_imgmsg(img_mask_numpy, "bgr8"))
-            
+          self.crop_mask_depth_pub.publish(self.bridge.cv2_to_imgmsg(depth_mask_numpy, "8UC1"))  
             
 
       if self.display_fps:
@@ -305,27 +415,10 @@ class YolactNode:
       det.box.x2 = int(x2)
       det.box.y2 = int(y2)
       mask = masks[detnum,y1:y2,x1:x2]
-      # print('type')
-      # print(type(det.mask.mask))
       det.mask.mask = np.packbits(mask.bool().cpu()).tolist()
       det.mask.height = int(y2 - y1)
       det.mask.width = int(x2 - x1)
       dets_msg.detections.append(det)
-      
-      # print(type(det.mask.mask))
-
-      # unpacked_mask = np.unpackbits(np.array(det.mask.mask,dtype=np.uint8), count=det.mask.height*det.mask.width)
-      
-      # unpacked_mask = unpacked_mask.reshape((det.mask.height, det.mask.width))
-      # print('unpacked_mask')
-      # print(type(unpacked_mask))
-      # print(unpacked_mask)
-
-      # if self.publish_visualization:
-      #   try:
-      #     self.crop_mask_pub.publish(self.bridge.cv2_to_imgmsg(unpacked_mask, "mono8"))
-      #   except CvBridgeError as e:
-      #     print(e)
 
       #encoding_correct = True
       #for x in range(det.mask.width):
@@ -340,6 +433,8 @@ class YolactNode:
   def evalimage(self, cv_image, image_header):
     with torch.no_grad():
       frame = torch.from_numpy(cv_image).cuda().float()
+      # if self.depth != None
+      # frame_depth = torch.from_numpy(self.depth).cuda().float()
       batch = FastBaseTransform()(frame.unsqueeze(0))
       preds = self.net(batch)
 
@@ -367,7 +462,6 @@ class YolactNode:
       if self.publish_visualization:
         try:
           self.image_pub.publish(self.bridge.cv2_to_imgmsg(image, "bgr8"))
-          # self.crop_mask_pub.publish(self.bridge.cv2_to_imgmsg(masks, "bgr8"))
         except CvBridgeError as e:
           print(e)
 
