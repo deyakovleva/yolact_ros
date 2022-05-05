@@ -87,8 +87,9 @@ class YolactNode:
     self.crop_mask_pub = rospy.Publisher("~crop_masks", Image, queue_size=1)
     self.crop_mask_depth_pub = rospy.Publisher("~crop_masks_depth", Image, queue_size=1)
 
-    depth_sub = message_filters.Subscriber('/camera/depth/image_rect_raw', Image, queue_size=10)
-    camera_sub = message_filters.Subscriber('/camera/depth/camera_info', CameraInfo, queue_size=10)
+    # depth_sub = message_filters.Subscriber('/camera/depth/image_rect_raw', Image, queue_size=10)
+    depth_sub = message_filters.Subscriber('/camera/aligned_depth_to_color/image_raw', Image, queue_size=1)
+    camera_sub = message_filters.Subscriber('/camera/depth/camera_info', CameraInfo, queue_size=1)
 
     self.detections_pub = rospy.Publisher("~detections", Detections, queue_size=1)
 
@@ -130,6 +131,12 @@ class YolactNode:
     ts = message_filters.ApproximateTimeSynchronizer(
     [depth_sub, camera_sub], 10, 0.1)
     ts.registerCallback(self.callback_depth)
+
+
+  def show_image(self, image, name):
+    cv2.imshow(name, image)
+    cv2.waitKey(0)
+
 
   def callback_depth(self, depth, cam_K):
 
@@ -259,7 +266,7 @@ class YolactNode:
           # This is 1 everywhere except for 1-mask_alpha where the mask is
           # inv_alph_masks все что не маска, mask_alpha - интенсивность маски 
           inv_alph_masks = masks * (- mask_alpha) + 1
-          inv_alph_masks_depth = masks * (- mask_alpha) + 1
+          inv_alph_masks_depth = masks
 
           # I did the math for this on pen and paper. This whole block should be equivalent to:
           #    for j in range(num_dets_to_consider):
@@ -272,82 +279,42 @@ class YolactNode:
               masks_color_cumul = masks_color[1:] * inv_alph_cumul
               masks_color_summand += masks_color_cumul.sum(dim=0)
 
-        
-          # print('img_gpu')
-          # print(img_gpu.size(dim=1))
-          # print('inv_alph_masks')
-          # print(inv_alph_masks.size(dim=1))
-          # print('masks_color_summand')
-          # print(masks_color_summand.size(dim=1))
-          # print('img_gpu')
-          # print(img_gpu.size(dim=0))
-          # print('inv_alph_masks')
-          # print(inv_alph_masks.size(dim=0))
-          # print('masks_color_summand')
-          # print(masks_color_summand.size(dim=0))
-          # print('----')
           img_gpu = img_gpu * inv_alph_masks.prod(dim=0) + masks_color_summand
-          # print('img_gpu')
-          # print(img_gpu.size(dim=1))
-          # print('inv_alph_masks')
-          # print(inv_alph_masks.size(dim=1))
-          # print('masks_color_summand')
-          # print(masks_color_summand.size(dim=1))
-          # print('img_gpu')
-          # print(img_gpu.size(dim=0))
-          # print('inv_alph_masks')
-          # print(inv_alph_masks.size(dim=0))
-          # print('masks_color_summand')
-          # print(masks_color_summand.size(dim=0))
-          # print('----')
-          # print('depth_gpu_torch')
-          # print(depth_gpu_torch.size(dim=1))
-          # print('inv_alph_masks')
-          # print(inv_alph_masks.size(dim=1))
-          # print('masks_color_summand')
-          # print(masks_color_summand.size(dim=1))
-          # print('depth_gpu_torch')
-          # print(depth_gpu_torch.size(dim=0))
-          # print('inv_alph_masks')
-          # print(inv_alph_masks.size(dim=0))
-          # print('masks_color_summand')
-          # print(masks_color_summand.size(dim=0))
-
-          # depth_gpu_torch = depth_gpu_torch * inv_alph_masks.prod(dim=0) + masks_color_summand
 
           # put all rgb masks in topic
           # выводит обрезанные маски в топик
           if mask_only:
-            # print('masks')
-            # print(masks.size())
             masks_no_color = masks.repeat(1, 1, 1, 3) #* mask_alpha
-            # print('masks_no_color')
-            # print(masks_no_color.size())
 
              # для массива всех масок, чтоб все выводились а не одна
             masks_no_color_summand = masks_no_color[0]
-            masks_summand = masks[0]
+            masks_summand = masks[0] 
 
             if num_dets_to_consider > 1:
               inv_alph_cumul = inv_alph_masks[:(num_dets_to_consider-1)].cumprod(dim=0)
               masks_no_color_cumul = masks_no_color[1:] * inv_alph_cumul
               masks_no_color_summand += masks_no_color_cumul.sum(dim=0)
 
-              masks_cumul = masks[1:] * inv_alph_cumul
-              masks_summand += masks_cumul.sum(dim=0)              
-            # print('masks_no_color_sum')
-            # print(masks_no_color_summand.size())
-            img_mask =  inv_alph_masks.prod(dim=0) + masks_no_color_summand * img
-            # print('img')
-            # print(img.size())
+              # inv_alph_cumul_d = masks[:(num_dets_to_consider-1)].cumprod(dim=0)
+              # masks_cumul = masks[1:] * inv_alph_cumul
+              # masks_summand += masks_cumul.sum(dim=0)
+
+            # depth_mask = masks.prod(dim=0) + masks_summand * depth_gpu_torch
+            depth_mask_numpy = (masks).byte().cpu().numpy()
+            depth_mask_numpy_ = np.multiply(depth_mask_numpy[0,:,:,0], self.depth)
+            self.crop_mask_depth_pub.publish(self.bridge.cv2_to_imgmsg(depth_mask_numpy_, "32FC1"))
+            
+            img_mask = inv_alph_masks.prod(dim=0) + masks_no_color_summand * img
             img_mask_numpy = (img_mask).byte().cpu().numpy()
-            # print(depth_gpu_torch.size())
+            self.crop_mask_pub.publish(self.bridge.cv2_to_imgmsg(img_mask_numpy, "bgr8"))          
+          
 
-            depth_mask = inv_alph_masks_depth.prod(dim=0) + masks_summand * depth_gpu_torch
-            depth_mask_numpy = (depth_mask).byte().cpu().numpy()
-
-          self.crop_mask_pub.publish(self.bridge.cv2_to_imgmsg(img_mask_numpy, "bgr8"))
-          self.crop_mask_depth_pub.publish(self.bridge.cv2_to_imgmsg(depth_mask_numpy, "8UC1"))  
+          
+          # проблема либо в masks, тк inv_alph_masks проходят проверку в if
+          # либо depth_mask_numpy[:,:,0] из-за 0
+          # либо masks_summand, может в него не складывается? 
+          # self.crop_mask_pub.publish(self.bridge.cv2_to_imgmsg(img_mask_numpy, "bgr8"))
+          # self.crop_mask_depth_pub.publish(self.bridge.cv2_to_imgmsg(depth_mask_numpy_, "32FC1"))
             
 
       if self.display_fps:
